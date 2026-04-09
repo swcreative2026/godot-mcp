@@ -101,6 +101,38 @@ With environment variables:
 claude mcp add godot -e GODOT_PATH=/path/to/godot -e DEBUG=true -- npx @coding-solo/godot-mcp
 ```
 
+### Run Locally from Source (Claude Code)
+
+Use this when you want to run the repo directly — for example, to pick up unreleased tools like `capture_screenshot` before they ship on npm. Build the project, then register the local `build/index.js` with Claude Code:
+
+```bash
+git clone https://github.com/swcreative2026/godot-mcp.git
+cd godot-mcp
+npm install
+npm run build
+claude mcp add godot -- node "$(pwd)/build/index.js"
+```
+
+With environment variables:
+
+```bash
+claude mcp add godot -e GODOT_PATH=/path/to/godot -e DEBUG=true -- node "$(pwd)/build/index.js"
+```
+
+Restart Claude Code and run `/mcp` to verify the `godot` server is listed. To check the tools are exposed, ask Claude "list the godot mcp tools" — you should see `capture_screenshot` alongside `run_project`, `launch_editor`, etc.
+
+To pick up new changes later, rebuild in the checkout:
+
+```bash
+cd godot-mcp
+git pull
+npm run build
+```
+
+Claude Code will use the updated build on the next invocation — no re-registration needed.
+
+**Note:** `capture_screenshot` requires starting the project with the opt-in wrapper. Ask Claude to "run my Godot project at /path/to/project with screenshots enabled" (which calls `run_project` with `captureEnabled: true`), then "take a screenshot of the running project".
+
 <details>
 <summary><strong>Cline</strong></summary>
 
