@@ -78,6 +78,7 @@ interface GodotProcess {
   output: string[];
   errors: string[];
   projectPath: string;
+  captureEnabled: boolean;
 }
 
 /**
@@ -128,6 +129,7 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    'capture_enabled': 'captureEnabled',
   };
 
   /**
@@ -786,6 +788,10 @@ class GodotServer {
                 type: 'string',
                 description: 'Optional: Specific scene to run',
               },
+              captureEnabled: {
+                type: 'boolean',
+                description: 'Optional: If true, launches via a wrapper scene that enables capture_screenshot. Note: wraps the main scene as a child of an MCPWrapper node, which may affect code relying on get_tree().current_scene. Defaults to false.',
+              },
             },
             required: ['projectPath'],
           },
@@ -1197,14 +1203,26 @@ class GodotServer {
 
       this.cleanupScreenshotArtifacts(args.projectPath);
 
-      const sceneToRun = this.tryResolveMainScene(args.projectPath, args.scene);
+      const validScene = args.scene && this.validatePath(args.scene) ? args.scene : undefined;
+      const captureEnabled = args.captureEnabled === true;
+      let wrapperActive = false;
       const cmdArgs = ['-d', '--path', args.projectPath];
 
-      if (sceneToRun && this.initializeScreenshotWrapper(args.projectPath, sceneToRun)) {
-        cmdArgs.push('.mcp_wrapper.tscn');
-      } else if (args.scene && this.validatePath(args.scene)) {
+      if (captureEnabled) {
+        const sceneToRun = this.tryResolveMainScene(args.projectPath, validScene);
+        if (sceneToRun && this.initializeScreenshotWrapper(args.projectPath, sceneToRun)) {
+          cmdArgs.push('.mcp_wrapper.tscn');
+          wrapperActive = true;
+        } else {
+          this.logDebug('captureEnabled requested but wrapper could not be initialized; falling back to normal launch');
+          if (validScene) {
+            this.logDebug(`Adding scene parameter: ${args.scene}`);
+            cmdArgs.push(validScene);
+          }
+        }
+      } else if (validScene) {
         this.logDebug(`Adding scene parameter: ${args.scene}`);
-        cmdArgs.push(args.scene);
+        cmdArgs.push(validScene);
       }
 
       this.logDebug(`Running Godot project: ${args.projectPath}`);
@@ -1231,6 +1249,7 @@ class GodotServer {
       process.on('exit', (code: number | null) => {
         this.logDebug(`Godot process exited with code ${code}`);
         if (this.activeProcess && this.activeProcess.process === process) {
+          this.cleanupScreenshotArtifacts(this.activeProcess.projectPath);
           this.activeProcess = null;
         }
       });
@@ -1238,11 +1257,12 @@ class GodotServer {
       process.on('error', (err: Error) => {
         console.error('Failed to start Godot process:', err);
         if (this.activeProcess && this.activeProcess.process === process) {
+          this.cleanupScreenshotArtifacts(this.activeProcess.projectPath);
           this.activeProcess = null;
         }
       });
 
-      this.activeProcess = { process, output, errors, projectPath: args.projectPath };
+      this.activeProcess = { process, output, errors, projectPath: args.projectPath, captureEnabled: wrapperActive };
 
       return {
         content: [
@@ -1620,6 +1640,16 @@ class GodotServer {
         [
           'Pass the same projectPath that was used with run_project',
           'Stop the current project and start the target project first',
+        ]
+      );
+    }
+
+    if (!this.activeProcess.captureEnabled) {
+      return this.createErrorResponse(
+        'Screenshot capture is not enabled for the active Godot process.',
+        [
+          'Stop the current project with stop_project',
+          'Start it again with run_project using captureEnabled: true',
         ]
       );
     }
