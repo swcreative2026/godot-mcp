@@ -9,7 +9,7 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -32,6 +32,44 @@ const execFileAsync = promisify(execFile);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+const SCREENSHOT_WRAPPER_SCRIPT = `extends Node
+
+const REAL_MAIN_SCENE = "REPLACE_WITH_MAIN_SCENE_PATH"
+const TRIGGER_FILE = "res://.mcp_screenshot_req"
+const OUTPUT_FILE = "res://.mcp_screenshot.png"
+
+func _ready():
+\tprint("[MCP] Wrapper loaded. Starting main scene: ", REAL_MAIN_SCENE)
+\tif ResourceLoader.exists(REAL_MAIN_SCENE):
+\t\tvar main_packed = load(REAL_MAIN_SCENE)
+\t\tvar main_inst = main_packed.instantiate()
+\t\tadd_child.call_deferred(main_inst)
+\telse:
+\t\tprinterr("[MCP] Error: Could not find main scene at ", REAL_MAIN_SCENE)
+
+func _process(_delta):
+\tif FileAccess.file_exists(TRIGGER_FILE):
+\t\t_take_screenshot()
+\t\tDirAccess.remove_absolute(TRIGGER_FILE)
+
+func _take_screenshot():
+\tprint("[MCP] Capturing screenshot...")
+\tvar image = get_viewport().get_texture().get_image()
+\tvar error = image.save_png(OUTPUT_FILE)
+\tif error == OK:
+\t\tprint("[MCP] Screenshot saved to ", OUTPUT_FILE)
+\telse:
+\t\tprinterr("[MCP] Failed to save screenshot. Error code: ", error)
+`;
+
+const SCREENSHOT_WRAPPER_SCENE = `[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://.mcp_wrapper.gd" id="1_mcp"]
+
+[node name="MCPWrapper" type="Node"]
+script = ExtResource("1_mcp")
+`;
+
 /**
  * Interface representing a running Godot process
  */
@@ -39,6 +77,8 @@ interface GodotProcess {
   process: any;
   output: string[];
   errors: string[];
+  projectPath: string;
+  captureEnabled: boolean;
 }
 
 /**
@@ -89,6 +129,7 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    'capture_enabled': 'captureEnabled',
   };
 
   /**
@@ -385,10 +426,72 @@ class GodotServer {
     this.logDebug('Cleaning up resources');
     if (this.activeProcess) {
       this.logDebug('Killing active Godot process');
+      this.cleanupScreenshotArtifacts(this.activeProcess.projectPath);
       this.activeProcess.process.kill();
       this.activeProcess = null;
     }
     await this.server.close();
+  }
+
+  private tryResolveMainScene(projectPath: string, scene?: string): string | null {
+    let sceneToRun: string | null = scene?.trim() ?? null;
+
+    if (!sceneToRun) {
+      try {
+        const projectFile = join(projectPath, 'project.godot');
+        const projectContent = readFileSync(projectFile, 'utf-8');
+        const match = projectContent.match(/run\/main_scene="([^"]+)"/);
+        sceneToRun = match?.[1] ?? null;
+      } catch (error) {
+        this.logDebug(`Failed to resolve main scene from project.godot: ${error}`);
+        sceneToRun = null;
+      }
+    }
+
+    if (!sceneToRun) {
+      return null;
+    }
+
+    return sceneToRun.startsWith('res://')
+      ? sceneToRun
+      : `res://${sceneToRun.replace(/\\/g, '/')}`;
+  }
+
+  private initializeScreenshotWrapper(projectPath: string, scenePath: string): boolean {
+    try {
+      const wrapperScriptPath = join(projectPath, '.mcp_wrapper.gd');
+      const wrapperScenePath = join(projectPath, '.mcp_wrapper.tscn');
+      const wrapperScriptContent = SCREENSHOT_WRAPPER_SCRIPT.replace('REPLACE_WITH_MAIN_SCENE_PATH', scenePath);
+
+      writeFileSync(wrapperScriptPath, wrapperScriptContent, 'utf8');
+      writeFileSync(wrapperScenePath, SCREENSHOT_WRAPPER_SCENE, 'utf8');
+
+      this.logDebug(`Initialized screenshot wrapper for scene: ${scenePath}`);
+      return true;
+    } catch (error) {
+      this.logDebug(`Failed to initialize screenshot wrapper: ${error}`);
+      return false;
+    }
+  }
+
+  private cleanupScreenshotArtifacts(projectPath: string): void {
+    try {
+      const files = [
+        '.mcp_wrapper.gd',
+        '.mcp_wrapper.tscn',
+        '.mcp_screenshot_req',
+        '.mcp_screenshot.png',
+      ];
+
+      for (const file of files) {
+        const filePath = join(projectPath, file);
+        if (existsSync(filePath)) {
+          unlinkSync(filePath);
+        }
+      }
+    } catch (error) {
+      this.logDebug(`Failed to clean screenshot artifacts: ${error}`);
+    }
   }
 
   /**
@@ -685,6 +788,10 @@ class GodotServer {
                 type: 'string',
                 description: 'Optional: Specific scene to run',
               },
+              captureEnabled: {
+                type: 'boolean',
+                description: 'Optional: If true, launches via a wrapper scene that enables capture_screenshot. Note: wraps the main scene as a child of an MCPWrapper node, which may affect code relying on get_tree().current_scene. Defaults to false.',
+              },
             },
             required: ['projectPath'],
           },
@@ -737,6 +844,20 @@ class GodotServer {
         {
           name: 'get_project_info',
           description: 'Retrieve metadata about a Godot project',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'capture_screenshot',
+          description: 'Capture a screenshot of the running Godot project',
           inputSchema: {
             type: 'object',
             properties: {
@@ -934,6 +1055,8 @@ class GodotServer {
           return await this.handleListProjects(request.params.arguments);
         case 'get_project_info':
           return await this.handleGetProjectInfo(request.params.arguments);
+        case 'capture_screenshot':
+          return await this.handleCaptureScreenshot(request.params.arguments);
         case 'create_scene':
           return await this.handleCreateScene(request.params.arguments);
         case 'add_node':
@@ -1074,13 +1197,32 @@ class GodotServer {
       // Kill any existing process
       if (this.activeProcess) {
         this.logDebug('Killing existing Godot process before starting a new one');
+        this.cleanupScreenshotArtifacts(this.activeProcess.projectPath);
         this.activeProcess.process.kill();
       }
 
+      this.cleanupScreenshotArtifacts(args.projectPath);
+
+      const validScene = args.scene && this.validatePath(args.scene) ? args.scene : undefined;
+      const captureEnabled = args.captureEnabled === true;
+      let wrapperActive = false;
       const cmdArgs = ['-d', '--path', args.projectPath];
-      if (args.scene && this.validatePath(args.scene)) {
+
+      if (captureEnabled) {
+        const sceneToRun = this.tryResolveMainScene(args.projectPath, validScene);
+        if (sceneToRun && this.initializeScreenshotWrapper(args.projectPath, sceneToRun)) {
+          cmdArgs.push('.mcp_wrapper.tscn');
+          wrapperActive = true;
+        } else {
+          this.logDebug('captureEnabled requested but wrapper could not be initialized; falling back to normal launch');
+          if (validScene) {
+            this.logDebug(`Adding scene parameter: ${args.scene}`);
+            cmdArgs.push(validScene);
+          }
+        }
+      } else if (validScene) {
         this.logDebug(`Adding scene parameter: ${args.scene}`);
-        cmdArgs.push(args.scene);
+        cmdArgs.push(validScene);
       }
 
       this.logDebug(`Running Godot project: ${args.projectPath}`);
@@ -1107,6 +1249,7 @@ class GodotServer {
       process.on('exit', (code: number | null) => {
         this.logDebug(`Godot process exited with code ${code}`);
         if (this.activeProcess && this.activeProcess.process === process) {
+          this.cleanupScreenshotArtifacts(this.activeProcess.projectPath);
           this.activeProcess = null;
         }
       });
@@ -1114,11 +1257,12 @@ class GodotServer {
       process.on('error', (err: Error) => {
         console.error('Failed to start Godot process:', err);
         if (this.activeProcess && this.activeProcess.process === process) {
+          this.cleanupScreenshotArtifacts(this.activeProcess.projectPath);
           this.activeProcess = null;
         }
       });
 
-      this.activeProcess = { process, output, errors };
+      this.activeProcess = { process, output, errors, projectPath: args.projectPath, captureEnabled: wrapperActive };
 
       return {
         content: [
@@ -1187,6 +1331,7 @@ class GodotServer {
     }
 
     this.logDebug('Stopping active Godot process');
+    this.cleanupScreenshotArtifacts(this.activeProcess.projectPath);
     this.activeProcess.process.kill();
     const output = this.activeProcess.output;
     const errors = this.activeProcess.errors;
@@ -1461,6 +1606,100 @@ class GodotServer {
           'Ensure Godot is installed correctly',
           'Check if the GODOT_PATH environment variable is set correctly',
           'Verify the project path is accessible',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the capture_screenshot tool
+   */
+  private async handleCaptureScreenshot(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (!this.activeProcess) {
+      return this.createErrorResponse(
+        'No active Godot process.',
+        [
+          'Use run_project to start a Godot project first',
+          'Screenshots can only be taken from a running project started by this server',
+        ]
+      );
+    }
+
+    if (normalize(args.projectPath) !== normalize(this.activeProcess.projectPath)) {
+      return this.createErrorResponse(
+        'Requested project does not match the active Godot process.',
+        [
+          'Pass the same projectPath that was used with run_project',
+          'Stop the current project and start the target project first',
+        ]
+      );
+    }
+
+    if (!this.activeProcess.captureEnabled) {
+      return this.createErrorResponse(
+        'Screenshot capture is not enabled for the active Godot process.',
+        [
+          'Stop the current project with stop_project',
+          'Start it again with run_project using captureEnabled: true',
+        ]
+      );
+    }
+
+    try {
+      const triggerFile = join(args.projectPath, '.mcp_screenshot_req');
+      const outputFile = join(args.projectPath, '.mcp_screenshot.png');
+
+      if (existsSync(outputFile)) {
+        unlinkSync(outputFile);
+      }
+
+      writeFileSync(triggerFile, '', 'utf8');
+      this.logDebug('Created screenshot trigger file');
+
+      for (let attempt = 0; attempt < 50; attempt++) {
+        if (existsSync(outputFile)) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Screenshot captured successfully: ${outputFile}`,
+              },
+              {
+                type: 'image',
+                data: readFileSync(outputFile).toString('base64'),
+                mimeType: 'image/png',
+              },
+            ],
+          };
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+
+      return this.createErrorResponse(
+        'Timed out waiting for screenshot.',
+        [
+          'Ensure the project is running correctly',
+          'Check if the wrapper scene was loaded successfully',
+        ]
+      );
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to capture screenshot: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure the project path is accessible',
+          'Check file permissions',
         ]
       );
     }
